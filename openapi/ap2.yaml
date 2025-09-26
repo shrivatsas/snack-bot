@@ -1,0 +1,212 @@
+openapi: 3.0.3
+info:
+  title: AP2 (Agent Payment Protocol) API
+  description: API for agent payment mandates and processing
+  version: 1.0.0
+servers:
+  - url: http://localhost:5000
+    description: Local development server
+
+paths:
+  /ap2/mandate.create:
+    post:
+      summary: Create payment mandate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MandateRequest'
+      responses:
+        '200':
+          description: Mandate created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MandateResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /ap2/pay:
+    post:
+      summary: Process payment with signed mandate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+      responses:
+        '200':
+          description: Payment processed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '400':
+          description: Payment failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /ap2/payment.status:
+    get:
+      summary: Get payment status
+      parameters:
+        - name: paymentId
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Payment status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentStatus'
+
+components:
+  schemas:
+    MandateRequest:
+      type: object
+      properties:
+        cartId:
+          type: string
+          description: Cart ID from A2A cart.lock
+        payerRef:
+          type: string
+          description: Payer reference (team identifier)
+        amount:
+          type: number
+          description: Payment amount in cents
+        currency:
+          type: string
+          default: USD
+        ttl:
+          type: string
+          format: date-time
+          description: Mandate expiration time
+        metadata:
+          type: object
+          description: Additional payment metadata
+      required:
+        - cartId
+        - payerRef
+        - amount
+        - ttl
+
+    MandateResponse:
+      type: object
+      properties:
+        mandateId:
+          type: string
+        cartId:
+          type: string
+        payerRef:
+          type: string
+        amount:
+          type: number
+        currency:
+          type: string
+        ttl:
+          type: string
+          format: date-time
+        challengeData:
+          type: string
+          description: Data to be signed by payer
+        created:
+          type: string
+          format: date-time
+      required:
+        - mandateId
+        - cartId
+        - payerRef
+        - amount
+        - challengeData
+
+    PaymentRequest:
+      type: object
+      properties:
+        mandateId:
+          type: string
+        signature:
+          type: string
+          description: Base64-encoded Ed25519 signature of challengeData
+        publicKey:
+          type: string
+          description: Base64-encoded Ed25519 public key
+      required:
+        - mandateId
+        - signature
+        - publicKey
+
+    PaymentResponse:
+      type: object
+      properties:
+        paymentId:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        amount:
+          type: number
+        transactionRef:
+          type: string
+          description: External transaction reference
+        processed:
+          type: string
+          format: date-time
+      required:
+        - paymentId
+        - status
+        - amount
+
+    PaymentStatus:
+      type: object
+      properties:
+        paymentId:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, completed, failed, cancelled]
+        amount:
+          type: number
+        currency:
+          type: string
+        mandateId:
+          type: string
+        created:
+          type: string
+          format: date-time
+        updated:
+          type: string
+          format: date-time
+        transactionRef:
+          type: string
+        failureReason:
+          type: string
+          description: Reason for failure if status is failed
+      required:
+        - paymentId
+        - status
+        - amount
+        - mandateId
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+        code:
+          type: string
+      required:
+        - error
+        - message

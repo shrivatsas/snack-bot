@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  office-agent:
+    build:
+      context: ../apps/office-agent
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - SHEET_ID=${SHEET_ID:-mock}
+      - WEBHOOK_URL=${WEBHOOK_URL:-http://webhook-endpoint:80/webhook}
+      - VENDOR_AGENT_URL=http://vendor-agent:4000
+      - PAYMENT_AGENT_URL=http://vendor-agent:5001
+      - PRIVATE_KEY_PATH=/app/keys/dev_ed25519.pem
+    volumes:
+      - ../apps/office-agent/keys:/app/keys
+      - office-logs:/app/logs
+    depends_on:
+      - vendor-agent
+      - webhook-endpoint
+    networks:
+      - snack-bot
+
+  vendor-agent:
+    build:
+      context: ../apps/vendor-agent
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+      - "5001:5001"
+    environment:
+      - NODE_ENV=development
+      - PORT=4000
+      - PAYMENT_PORT=5001
+      - PRIVATE_KEY_PATH=/app/keys/vendor_ed25519.pem
+    volumes:
+      - ../apps/vendor-agent/keys:/app/keys
+      - vendor-logs:/app/logs
+    networks:
+      - snack-bot
+
+  webhook-endpoint:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./webhook-server.conf:/etc/nginx/conf.d/default.conf
+      - webhook-logs:/var/log/nginx
+    networks:
+      - snack-bot
+
+  # Optional: webhook.site alternative for local testing
+  webhook-catcher:
+    image: tarampampam/webhook-tester:latest
+    ports:
+      - "8081:8080"
+    environment:
+      - WEBHOOK_TESTER_LOG_LEVEL=info
+    networks:
+      - snack-bot
+
+volumes:
+  office-logs:
+  vendor-logs:
+  webhook-logs:
+
+networks:
+  snack-bot:
+    driver: bridge

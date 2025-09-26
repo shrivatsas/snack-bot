@@ -1,0 +1,277 @@
+openapi: 3.0.3
+info:
+  title: A2A (Agent-to-Agent) API
+  description: API for agent-to-agent negotiations and cart management
+  version: 1.0.0
+servers:
+  - url: http://localhost:4000
+    description: Local development server
+
+paths:
+  /a2a/catalog.query:
+    post:
+      summary: Query product catalog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogQuery'
+      responses:
+        '200':
+          description: Catalog items matching query
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogResponse'
+
+  /a2a/quote.create:
+    post:
+      summary: Create a quote for items
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteRequest'
+      responses:
+        '200':
+          description: Quote created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuoteResponse'
+
+  /a2a/negotiate:
+    post:
+      summary: Negotiate terms
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NegotiationRequest'
+      responses:
+        '200':
+          description: Negotiation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NegotiationResponse'
+
+  /a2a/cart.lock:
+    post:
+      summary: Lock cart for payment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CartLockRequest'
+      responses:
+        '200':
+          description: Cart locked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CartLockResponse'
+
+components:
+  schemas:
+    CatalogQuery:
+      type: object
+      properties:
+        categories:
+          type: array
+          items:
+            type: string
+        dietary:
+          type: array
+          items:
+            type: string
+          description: Dietary restrictions (vegan, gluten-free, etc.)
+        maxBudget:
+          type: number
+          description: Maximum budget per person
+      required:
+        - categories
+
+    CatalogResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogItem'
+      required:
+        - items
+
+    CatalogItem:
+      type: object
+      properties:
+        sku:
+          type: string
+        name:
+          type: string
+        price:
+          type: number
+        category:
+          type: string
+        dietary:
+          type: array
+          items:
+            type: string
+        minQuantity:
+          type: number
+          default: 1
+      required:
+        - sku
+        - name
+        - price
+        - category
+
+    QuoteRequest:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LineItem'
+        deliveryDate:
+          type: string
+          format: date
+        headcount:
+          type: number
+      required:
+        - items
+        - headcount
+
+    LineItem:
+      type: object
+      properties:
+        sku:
+          type: string
+        quantity:
+          type: number
+      required:
+        - sku
+        - quantity
+
+    QuoteResponse:
+      type: object
+      properties:
+        quoteId:
+          type: string
+        total:
+          type: number
+        lineItems:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuoteLineItem'
+        deliveryWindow:
+          type: string
+          description: Delivery time window
+        expires:
+          type: string
+          format: date-time
+      required:
+        - quoteId
+        - total
+        - lineItems
+
+    QuoteLineItem:
+      type: object
+      properties:
+        sku:
+          type: string
+        name:
+          type: string
+        quantity:
+          type: number
+        unitPrice:
+          type: number
+        totalPrice:
+          type: number
+      required:
+        - sku
+        - name
+        - quantity
+        - unitPrice
+        - totalPrice
+
+    NegotiationRequest:
+      type: object
+      properties:
+        quoteId:
+          type: string
+        counterOffer:
+          $ref: '#/components/schemas/CounterOffer'
+      required:
+        - quoteId
+        - counterOffer
+
+    CounterOffer:
+      type: object
+      properties:
+        targetTotal:
+          type: number
+          description: Target total price
+        adjustedItems:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItemAdjustment'
+        notes:
+          type: string
+
+    ItemAdjustment:
+      type: object
+      properties:
+        sku:
+          type: string
+        newQuantity:
+          type: number
+      required:
+        - sku
+        - newQuantity
+
+    NegotiationResponse:
+      type: object
+      properties:
+        accepted:
+          type: boolean
+        revisedQuote:
+          $ref: '#/components/schemas/QuoteResponse'
+        message:
+          type: string
+      required:
+        - accepted
+
+    CartLockRequest:
+      type: object
+      properties:
+        quoteId:
+          type: string
+      required:
+        - quoteId
+
+    CartLockResponse:
+      type: object
+      properties:
+        cartId:
+          type: string
+        total:
+          type: number
+        lineItems:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuoteLineItem'
+        deliveryWindow:
+          type: string
+        lockedUntil:
+          type: string
+          format: date-time
+      required:
+        - cartId
+        - total
+        - lineItems
+        - lockedUntil
