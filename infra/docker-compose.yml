@@ -12,6 +12,7 @@ services:
       - SHEET_ID=${SHEET_ID:-mock}
       - WEBHOOK_URL=${WEBHOOK_URL:-http://webhook-endpoint:80/webhook}
       - VENDOR_AGENT_URL=http://vendor-agent:4000
+      - PREMIUM_VENDOR_URL=http://vendor-agent:4001
       - PAYMENT_AGENT_URL=http://vendor-agent:5001
       - PRIVATE_KEY_PATH=/app/keys/dev_ed25519.pem
     volumes:
@@ -29,10 +30,12 @@ services:
       dockerfile: Dockerfile
     ports:
       - "4000:4000"
+      - "4001:4001"
       - "5001:5001"
     environment:
       - NODE_ENV=development
       - PORT=4000
+      - PREMIUM_PORT=4001
       - PAYMENT_PORT=5001
       - PRIVATE_KEY_PATH=/app/keys/vendor_ed25519.pem
     volumes:

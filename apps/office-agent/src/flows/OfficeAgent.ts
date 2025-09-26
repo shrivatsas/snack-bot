@@ -1,6 +1,6 @@
 import { SheetsClient, TeamMember } from '../mcp/SheetsClient';
 import { WebhookClient } from '../mcp/WebhookClient';
-import { A2AClient, CatalogQuery, QuoteRequest } from '../a2a/A2AClient';
+import { A2AClient, CatalogQuery, QuoteRequest, MultiVendorQuoteComparison } from '../a2a/A2AClient';
 import { AP2Client, MandateRequest } from '../ap2/AP2Client';
 import { AuditLogger } from '../store/AuditLogger';
 
@@ -8,7 +8,16 @@ export interface SnackFlowResult {
   success: boolean;
   cartId?: string;
   paymentId?: string;
+  deliveryMandateId?: string;
   total?: number;
+  initialPayment?: number;
+  deliveryPayment?: number;
+  selectedVendor?: string;
+  vendorComparison?: {
+    quotesReceived: number;
+    savings: number;
+    percentageSaved: number;
+  };
   error?: string;
   steps: string[];
 }
@@ -48,117 +57,173 @@ export class OfficeAgent {
       const analysis = this.analyzeTeamRequirements(teamMembers);
       steps.push(`Analyzed team: ${teamMembers.length} members, budget $${analysis.totalBudget}`);
 
-      // Step 4: Query catalog for suitable options
-      steps.push('Querying vendor catalog via A2A');
+      // Step 4: Query catalogs from all vendors
+      steps.push('Querying catalogs from all vendors via A2A');
       const catalogQuery: CatalogQuery = {
-        categories: ['hot-snacks', 'fresh', 'snacks', 'beverages'],
+        categories: ['hot-snacks', 'fresh', 'snacks', 'beverages', 'gourmet', 'healthy', 'sushi', 'salads', 'pastries', 'wraps'],
         dietary: analysis.dietaryRequirements,
-        maxBudget: Math.floor(analysis.averageBudget * 1.2)
+        maxBudget: Math.floor(analysis.totalBudget * 0.8) // Allow premium options up to 80% of total budget
       };
 
-      const catalogItems = await this.a2aClient.queryCatalog(catalogQuery);
-      await this.auditLogger.logStep(flowId, 'catalog_queried', { itemCount: catalogItems.length });
+      const allCatalogs = await this.a2aClient.queryCatalogFromAllVendors(catalogQuery);
+      const totalItems = Object.values(allCatalogs).reduce((sum, items) => sum + items.length, 0);
+      await this.auditLogger.logStep(flowId, 'multi_vendor_catalog_queried', {
+        vendorCount: Object.keys(allCatalogs).length,
+        totalItems
+      });
 
-      // Step 5: Send options for approval
-      steps.push('Sending snack options for team approval');
-      await this.webhookClient.sendSnackOptions(catalogItems);
+      // Step 5: Send multi-vendor options for approval
+      steps.push('Sending multi-vendor options for team approval');
+      await this.webhookClient.sendSnackOptions(Object.values(allCatalogs).flat());
 
-      // Step 6: Create quote (simulating approval)
-      steps.push('Creating quote with vendor');
-      const selectedItems = this.selectOptimalItems(catalogItems, analysis);
+      // Step 6: Create quotes from all vendors (let each vendor propose their best offering)
+      steps.push('Requesting quotes from all vendors');
 
-      const quoteRequest: QuoteRequest = {
-        items: selectedItems,
-        deliveryDate: this.calculateDeliveryDate(),
-        headcount: teamMembers.length
-      };
+      // Let each vendor propose their best offering based on team size and budget
+      const vendorComparison = await this.createVendorSpecificQuotes(allCatalogs, analysis, teamMembers.length);
+      await this.auditLogger.logStep(flowId, 'multi_vendor_quotes', {
+        quotesReceived: vendorComparison.allQuotes.length,
+        bestVendor: vendorComparison.bestBudgetQuote.vendor,
+        savings: vendorComparison.savings
+      });
 
-      const quote = await this.a2aClient.createQuote(quoteRequest);
-      await this.auditLogger.logStep(flowId, 'quote_created', { quoteId: quote.quoteId, total: quote.total });
+      steps.push(`Comparing ${vendorComparison.allQuotes.length} quotes - best: ${vendorComparison.bestBudgetQuote.vendor} ($${vendorComparison.bestBudgetQuote.total})`);
 
-      // Step 7: Request approval for quote
-      steps.push('Requesting approval for quote');
-      await this.webhookClient.requestApproval(quote);
+      // Step 7: Request approval for best quote
+      steps.push('Requesting approval for selected vendor');
+      await this.webhookClient.requestApproval(vendorComparison.bestOverallQuote);
 
-      // Step 8: Negotiate if needed (simple logic for demo)
-      if (quote.total > analysis.totalBudget * 0.9) {
-        steps.push('Negotiating price with vendor');
+      // Step 8: Negotiate with selected vendor if needed
+      let finalQuote = vendorComparison.bestOverallQuote;
+      if (finalQuote.total > analysis.totalBudget * 0.9) {
+        steps.push(`Negotiating price with ${finalQuote.vendor}`);
         const negotiationResult = await this.a2aClient.negotiate({
-          quoteId: quote.quoteId,
+          quoteId: finalQuote.quoteId,
           counterOffer: {
             targetTotal: Math.floor(analysis.totalBudget * 0.85),
             notes: 'Budget adjustment needed for team order'
           }
-        });
+        }, finalQuote.vendor, finalQuote.baseUrl);
 
         if (negotiationResult.accepted && negotiationResult.revisedQuote) {
           await this.auditLogger.logStep(flowId, 'negotiation_successful', negotiationResult);
-          Object.assign(quote, negotiationResult.revisedQuote);
+          Object.assign(finalQuote, negotiationResult.revisedQuote);
+          steps.push(`Negotiation successful - new total: $${finalQuote.total}`);
         } else {
           await this.auditLogger.logStep(flowId, 'negotiation_failed', negotiationResult);
+          steps.push('Negotiation failed - proceeding with original quote');
         }
       }
 
-      // Step 9: Lock cart
-      steps.push('Locking cart for payment');
-      const cart = await this.a2aClient.lockCart(quote.quoteId);
-      await this.auditLogger.logStep(flowId, 'cart_locked', { cartId: cart.cartId });
-
-      // Step 10: Create payment mandate
-      steps.push('Creating payment mandate via AP2');
-      const ttl = new Date();
-      ttl.setMinutes(ttl.getMinutes() + 10); // 10 minutes to pay
-
-      const mandateRequest: MandateRequest = {
+      // Step 9: Lock cart with selected vendor
+      steps.push(`Locking cart with ${finalQuote.vendor}`);
+      const cart = await this.a2aClient.lockCart(finalQuote.quoteId, finalQuote.vendor, finalQuote.baseUrl);
+      await this.auditLogger.logStep(flowId, 'cart_locked', {
         cartId: cart.cartId,
-        payerRef: 'TEAM-OPS-001',
-        amount: Math.round(cart.total * 100), // Convert to cents
-        ttl: ttl.toISOString(),
-        metadata: {
-          flowId,
-          teamSize: teamMembers.length
-        }
-      };
+        vendor: cart.vendor,
+        paymentTerms: cart.paymentTerms
+      });
 
-      const mandate = await this.ap2Client.createMandate(mandateRequest);
-      await this.auditLogger.logStep(flowId, 'mandate_created', { mandateId: mandate.mandateId });
+      let paymentResult: any;
+      let deliveryMandateId: string | undefined;
+      let initialPayment = 0;
+      let deliveryPayment = 0;
 
-      // Step 11: Process payment
-      steps.push('Processing payment with signed mandate');
-      const paymentResult = await this.ap2Client.processPayment(mandate);
-      await this.auditLogger.logStep(flowId, 'payment_initiated', { paymentId: paymentResult.paymentId });
+      // Step 10-12: Handle payments (split or full)
+      if (cart.paymentTerms && cart.paymentTerms.initialPayment > 0) {
+        steps.push(`Processing split payment: $${cart.paymentTerms.initialPayment} initial + $${cart.paymentTerms.deliveryPayment} on delivery`);
 
-      // Step 12: Wait for payment confirmation
-      steps.push('Waiting for payment confirmation');
-      await this.waitForPaymentConfirmation(paymentResult.paymentId);
+        const splitPaymentResult = await this.ap2Client.processSplitPayments(
+          cart.total,
+          cart.paymentTerms,
+          cart.cartId
+        );
 
-      const finalStatus = await this.ap2Client.getPaymentStatus(paymentResult.paymentId);
-      await this.auditLogger.logStep(flowId, 'payment_completed', finalStatus);
+        paymentResult = splitPaymentResult.initialPayment;
+        deliveryMandateId = splitPaymentResult.deliveryMandateId;
+        initialPayment = cart.paymentTerms.initialPayment;
+        deliveryPayment = cart.paymentTerms.deliveryPayment;
+
+        await this.auditLogger.logStep(flowId, 'split_payment_processed', {
+          initialPaymentId: paymentResult.paymentId,
+          deliveryMandateId,
+          initialAmount: initialPayment,
+          deliveryAmount: deliveryPayment
+        });
+
+        steps.push(`Initial payment of $${initialPayment} completed - delivery payment of $${deliveryPayment} scheduled`);
+      } else {
+        // Traditional full payment
+        steps.push('Processing full payment');
+        const ttl = new Date();
+        ttl.setMinutes(ttl.getMinutes() + 10);
+
+        const mandateRequest: MandateRequest = {
+          cartId: cart.cartId,
+          payerRef: 'TEAM-OPS-001',
+          amount: Math.round(cart.total * 100),
+          ttl: ttl.toISOString(),
+          metadata: {
+            flowId,
+            teamSize: teamMembers.length,
+            vendor: cart.vendor
+          }
+        };
+
+        const mandate = await this.ap2Client.createMandate(mandateRequest);
+        paymentResult = await this.ap2Client.processPayment(mandate);
+        await this.waitForPaymentConfirmation(paymentResult.paymentId);
+
+        steps.push(`Full payment of $${cart.total} completed`);
+      }
 
       // Step 13: Send confirmation
       steps.push('Sending payment confirmation');
-      await this.webhookClient.confirmPayment(finalStatus);
+      await this.webhookClient.confirmPayment({
+        ...paymentResult,
+        vendor: cart.vendor,
+        total: cart.total,
+        paymentType: deliveryMandateId ? 'split' : 'full',
+        initialPayment,
+        deliveryPayment
+      });
 
       // Step 14: Log order to sheets
       steps.push('Logging order to sheets');
       await this.sheetsClient.logOrder({
         cartId: cart.cartId,
         paymentId: paymentResult.paymentId,
+        deliveryMandateId,
+        vendor: cart.vendor,
         total: cart.total,
+        initialPayment,
+        deliveryPayment,
         timestamp: new Date().toISOString()
       });
 
       await this.auditLogger.logFlowComplete(flowId, {
         cartId: cart.cartId,
         paymentId: paymentResult.paymentId,
-        total: cart.total
+        deliveryMandateId,
+        vendor: cart.vendor,
+        total: cart.total,
+        savings: vendorComparison.savings
       });
 
       return {
         success: true,
         cartId: cart.cartId,
         paymentId: paymentResult.paymentId,
+        deliveryMandateId,
         total: cart.total,
+        initialPayment,
+        deliveryPayment,
+        selectedVendor: cart.vendor,
+        vendorComparison: {
+          quotesReceived: vendorComparison.allQuotes.length,
+          savings: vendorComparison.savings.maxSavings,
+          percentageSaved: vendorComparison.savings.percentageSaved
+        },
         steps
       };
 
@@ -195,39 +260,138 @@ export class OfficeAgent {
     };
   }
 
-  private selectOptimalItems(catalogItems: any[], analysis: any) {
-    // Simple selection logic for demo
-    const selectedItems = [];
-    let remainingBudget = analysis.totalBudget;
+  private selectOptimalItemsFromAllVendors(allCatalogs: { [vendorName: string]: any[] }, analysis: any) {
+    // For demo purposes, select items that exist in both vendors' catalogs to ensure fair comparison
+    console.log('Catalog items by vendor:', Object.keys(allCatalogs).map(vendor => ({
+      vendor,
+      itemCount: allCatalogs[vendor].length,
+      sampleItems: allCatalogs[vendor].slice(0, 2).map(item => ({ sku: item.sku, price: item.price }))
+    })));
 
-    // Prioritize items that satisfy dietary requirements
-    const suitableItems = catalogItems.filter(item => {
-      return analysis.dietaryRequirements.some((diet: string) =>
-        item.dietary.includes(diet)
-      ) || item.dietary.includes('vegan'); // Vegan works for everyone
-    });
+    // Look for common categories that both vendors can serve
+    const allItems = Object.values(allCatalogs).flat();
 
-    // Select a variety of items within budget
-    for (const item of suitableItems.slice(0, 3)) {
-      if (remainingBudget >= item.price) {
-        const quantity = Math.max(item.minQuantity || 1, 1);
+    // Prioritize beverage items as both vendors have coffee services
+    const beverageItems = allItems.filter(item =>
+      item.category === 'beverages' &&
+      item.price <= analysis.totalBudget * 0.6 // Affordable for team
+    );
+
+    // Select beverage items for fair comparison (coffee services)
+    if (beverageItems.length > 0) {
+      const selectedItems = [];
+
+      // Pick one representative beverage item that's affordable
+      const affordableBeverage = beverageItems.find(item =>
+        item.price <= 100 && // Reasonable price
+        (item.dietary.includes('vegan') || item.dietary.includes('vegetarian') || item.dietary.length === 0)
+      );
+
+      if (affordableBeverage) {
         selectedItems.push({
-          sku: item.sku,
-          quantity
+          sku: affordableBeverage.sku,
+          quantity: Math.max(affordableBeverage.minQuantity || 1, 1)
         });
-        remainingBudget -= item.price * quantity;
+        console.log(`Selected beverage item for vendor comparison: ${affordableBeverage.sku} ($${affordableBeverage.price})`);
+        return selectedItems;
       }
     }
 
-    // If no suitable items, select basic options
-    if (selectedItems.length === 0) {
+    // Fallback: select cheapest suitable items across all vendors
+    const suitableItems = allItems.filter(item => {
+      return item.price <= analysis.totalBudget * 0.4 && ( // Affordable
+        analysis.dietaryRequirements.some((diet: string) => item.dietary.includes(diet)) ||
+        item.dietary.includes('vegan') || item.dietary.includes('vegetarian') ||
+        item.dietary.length === 0 // No dietary restrictions
+      );
+    });
+
+    const sortedItems = suitableItems.sort((a, b) => a.price - b.price);
+    const selectedItems = [];
+
+    if (sortedItems.length > 0) {
       selectedItems.push({
-        sku: catalogItems[0]?.sku || 'snack-fruit-001',
-        quantity: 1
+        sku: sortedItems[0].sku,
+        quantity: Math.max(sortedItems[0].minQuantity || 1, 1)
       });
+      console.log(`Selected fallback item: ${sortedItems[0].sku} ($${sortedItems[0].price})`);
     }
 
+    console.log(`Selected ${selectedItems.length} items for multi-vendor comparison`);
     return selectedItems;
+  }
+
+  private async createVendorSpecificQuotes(allCatalogs: { [vendorName: string]: any[] }, analysis: any, headcount: number): Promise<any> {
+    const allQuotes: Array<any> = [];
+    const vendors = Object.keys(allCatalogs);
+
+    // Create vendor-specific quotes
+    for (const vendorName of vendors) {
+      const vendorItems = allCatalogs[vendorName];
+      if (vendorItems.length === 0) continue;
+
+      try {
+        // Select the best item from this vendor's catalog
+        const affordableItems = vendorItems.filter(item =>
+          item.price <= analysis.totalBudget * 0.8
+        );
+
+        if (affordableItems.length === 0) continue;
+
+        // Pick the most suitable item (prefer beverages for universal appeal)
+        const beverageItem = affordableItems.find(item => item.category === 'beverages');
+        const selectedItem = beverageItem || affordableItems[0];
+
+        const quoteRequest = {
+          items: [{
+            sku: selectedItem.sku,
+            quantity: Math.max(selectedItem.minQuantity || 1, 1)
+          }],
+          deliveryDate: this.calculateDeliveryDate(),
+          headcount: headcount
+        };
+
+        console.log(`Requesting quote from ${vendorName} for ${selectedItem.sku} ($${selectedItem.price})`);
+
+        const quote = await this.a2aClient.createQuoteFromVendor(vendorName, quoteRequest);
+        allQuotes.push({
+          ...quote,
+          vendor: vendorName
+        });
+
+      } catch (error) {
+        console.warn(`Failed to get quote from ${vendorName}:`, error);
+      }
+    }
+
+    // Process and compare quotes
+    if (allQuotes.length === 0) {
+      throw new Error('No valid quotes received from any vendor');
+    }
+
+    const validQuotes = allQuotes.filter(quote => quote.total > 0);
+    const bestBudgetQuote = validQuotes.reduce((prev, current) =>
+      current.total < prev.total ? current : prev
+    );
+    const bestOverallQuote = bestBudgetQuote; // For now, same as budget
+
+    // Calculate savings
+    const maxTotal = Math.max(...validQuotes.map(q => q.total));
+    const maxSavings = maxTotal - bestBudgetQuote.total;
+    const percentageSaved = maxSavings > 0 ? ((maxSavings / maxTotal) * 100) : 0;
+
+    console.log(`Quote comparison: ${validQuotes.length} quotes, best: ${bestBudgetQuote.vendor} ($${bestBudgetQuote.total}), savings: $${maxSavings}`);
+
+    return {
+      bestOverallQuote,
+      bestBudgetQuote,
+      allQuotes: validQuotes,
+      savings: {
+        maxSavings,
+        percentageSaved,
+        recommendedVendor: bestOverallQuote.vendor
+      }
+    };
   }
 
   private calculateDeliveryDate(): string {

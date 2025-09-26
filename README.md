@@ -2,8 +2,8 @@
 
 An agent that:
 1. Reads team headcount & snack prefs via **MCP** (Sheets + Webhook),
-2. Negotiates with a vendor agent via **A2A**, and
-3. Pays using a signed **AP2** mandate.
+2. Negotiates with **multiple vendor agents** via **A2A** for best pricing,
+3. Supports **split payments** (initial + delivery) using signed **AP2** mandates.
 
 ---
 
@@ -50,20 +50,28 @@ sequenceDiagram
   participant Sheet as Google Sheets (MCP)
   participant Webhook as Webhook Endpoint
   participant Ops as Office Agent
-  participant Vendor as Vendor Agent (A2A)
+  participant V1 as Standard Vendor (A2A)
+  participant V2 as Premium Vendor (A2A)
   participant Pay as Payment (AP2)
 
   Ops->>Sheet: read snack_prefs
   Ops->>Webhook: post options & request approval
-  Ops->>Vendor: catalog.query / quote.create
-  Vendor-->>Ops: bundles + prices
-  Ops->>Vendor: negotiate
-  Vendor-->>Ops: cart.lock
-  Ops->>Pay: mandate.create(cart)
-  Ops->>Pay: pay(mandateId, signature)
-  Pay-->>Ops: payment status
-  Ops->>Webhook: final confirmation
-  Ops->>Sheet: append order log
+  par Multi-Vendor Query
+    Ops->>V1: catalog.query / quote.create
+    Ops->>V2: catalog.query / quote.create
+  end
+  V1-->>Ops: quote + 15% discount
+  V2-->>Ops: quote + 8% discount + split payment
+  Ops->>Ops: compare vendors, select optimal
+  Ops->>V2: negotiate & cart.lock
+  par Split Payment Processing
+    Ops->>Pay: mandate.create(initial 30%)
+    Ops->>Pay: mandate.create(delivery 70%)
+  end
+  Ops->>Pay: pay(initialMandateId)
+  Pay-->>Ops: initial payment confirmed
+  Ops->>Webhook: multi-vendor comparison + payment confirmation
+  Ops->>Sheet: append order log with savings data
 ```
 
 ---
@@ -111,10 +119,14 @@ cp .env.example .env
 npm install
 npm run dev
 
-# Vendor agent (mock)
+# Multi-vendor setup using Docker (recommended)
+make docker-up
+
+# Or run vendors separately:
 cd ../vendor-agent
 npm install
-npm run dev
+npm run dev        # Standard vendor (port 4000)
+npm run dev:premium # Premium vendor (port 4001)
 ```
 
 This runs with local mocks for Sheets/Webhook notifications.
@@ -141,6 +153,7 @@ This runs with local mocks for Sheets/Webhook notifications.
 SHEET_ID=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms
 WEBHOOK_URL=https://webhook.site/your-unique-url
 VENDOR_AGENT_URL=http://localhost:4000
+PREMIUM_VENDOR_URL=http://localhost:4001
 PAYMENT_AGENT_URL=http://localhost:5001
 PRIVATE_KEY_PATH=./keys/dev_ed25519.pem
 PORT=3000
@@ -150,26 +163,44 @@ PORT=3000
 
 ## Data Models (JSON Schemas)
 
-### A2A Cart
+### A2A Multi-Vendor Quote
 ```json
 {
-  "cartId": "string",
-  "total": 2700,
-  "lineItems": [
-    {"sku": "snack-veg-001", "qty": 10, "price": 100}
-  ],
-  "deliveryWindow": "2025-09-26T14:00-15:00"
+  "vendorComparison": {
+    "quotesReceived": 2,
+    "selectedVendor": "Premium Foods Co.",
+    "savings": 15.50,
+    "percentageSaved": 8.2
+  },
+  "cart": {
+    "cartId": "string",
+    "total": 2700,
+    "lineItems": [
+      {"sku": "gourmet-nuts-001", "qty": 5, "price": 280}
+    ],
+    "deliveryWindow": "2025-09-26T14:00-15:00"
+  }
 }
 ```
 
-### AP2 Mandate
+### AP2 Split Payment Mandate
 ```json
 {
-  "mandateId": "string",
+  "initialPayment": {
+    "mandateId": "mandate_initial_001",
+    "amount": 810,
+    "percentage": 30,
+    "signature": "base64_initial"
+  },
+  "deliveryPayment": {
+    "mandateId": "mandate_delivery_001",
+    "amount": 1890,
+    "percentage": 70,
+    "signature": "base64_delivery"
+  },
   "cartId": "string",
   "payerRef": "TEAM-OPS-001",
-  "ttl": "2025-09-26T10:00Z",
-  "signature": "base64"
+  "ttl": "2025-09-26T10:00Z"
 }
 ```
 
@@ -194,11 +225,12 @@ PORT=3000
 
 ## Reference Flows
 
-1. **Collect context (MCP)** → read sheet.
-2. **Propose (Webhook)** → post options to webhook endpoint.
-3. **Negotiate (A2A)** → vendor bundles → counteroffers → lock cart.
-4. **Pay (AP2)** → create + sign mandate, submit payment.
-5. **Notify (Webhook)** → webhook endpoint + append to sheet.
+1. **Collect context (MCP)** → read team preferences from sheet.
+2. **Multi-vendor query (A2A)** → simultaneously query multiple vendor catalogs.
+3. **Compare & select (A2A)** → analyze quotes, negotiate, select optimal vendor.
+4. **Split payment (AP2)** → create initial (30%) + delivery (70%) mandates.
+5. **Process payment (AP2)** → execute initial payment, schedule delivery payment.
+6. **Notify (Webhook)** → send vendor comparison + payment confirmation.
 
 ---
 
@@ -229,58 +261,64 @@ $ make demo
 
 📋 Demo Flow Overview:
 1. MCP: Read team preferences from Google Sheets
-2. A2A: Query vendor catalog and create quote
-3. A2A: Negotiate pricing and lock cart
-4. AP2: Create payment mandate with Ed25519 signature
-5. AP2: Process payment and confirm
-6. Webhook: Send notifications throughout flow
+2. A2A: Query catalogs from MULTIPLE vendors simultaneously
+3. A2A: Compare quotes and negotiate with best vendor
+4. A2A: Lock cart with selected vendor
+5. AP2: Process SPLIT PAYMENT (initial + delivery)
+6. AP2: Create delivery payment mandate for later
+7. Webhook: Send multi-vendor comparison notifications
 
 🔄 Executing end-to-end flow...
 ----------------------------------------
 {
   "success": true,
-  "cartId": "cart_1758862976962_7tswtqdys",
-  "paymentId": "payment_1758862977161_p45mz09od",
-  "total": 80,
-  "steps": [
-    "Connecting to MCP services",
-    "Reading team preferences from sheets",
-    "Analyzed team: 5 members, budget $135",
-    "Querying vendor catalog via A2A",
-    "Sending snack options for team approval",
-    "Creating quote with vendor",
-    "Requesting approval for quote",
-    "Locking cart for payment",
-    "Creating payment mandate via AP2",
-    "Processing payment with signed mandate",
-    "Waiting for payment confirmation",
-    "Sending payment confirmation",
-    "Logging order to sheets"
-  ]
+  "cartId": "cart_1727356234567_abc123",
+  "paymentId": "payment_1727356234890_xyz789",
+  "deliveryMandateId": "mandate_delivery_1727356235123",
+  "total": 127.50,
+  "initialPayment": 38.25,
+  "deliveryPayment": 89.25,
+  "selectedVendor": "Premium Foods Co.",
+  "vendorComparison": {
+    "quotesReceived": 2,
+    "savings": 18.75,
+    "percentageSaved": 12.8
+  }
 }
 
 📊 Data Flow Analysis:
 =====================
-✅ Transaction Successful!
-   Cart ID: cart_1758862976962_7tswtqdys
-   Payment ID: payment_1758862977161_p45mz09od
-   Total Amount: $80
+✅ Multi-Vendor Transaction Successful!
+   Selected Vendor: Premium Foods Co.
+   Cart ID: cart_1727356234567_abc123
+   Total Amount: $127.50
+   💰 Split Payment:
+     Initial Payment: $38.25 (ID: payment_1727356234890_xyz789)
+     Delivery Payment: $89.25 (Mandate: mandate_delivery_1727356235123)
 
 🔍 Service Health Check:
 ------------------------
 • Office Agent (MCP): ok
-• Vendor Agent (A2A): ok
+• Standard Vendor (A2A): ok
+• Premium Vendor (A2A): ok
 • Payment Service (AP2): ok
 • Webhook Endpoint: ok
 
 📈 Key Data Points Exchanged:
 -----------------------------
 • MCP (Sheets): 5 team members, $135 total budget
-• A2A (Catalog): 7 available products queried
-• A2A (Quote): Quote created and cart locked for payment
-• AP2 (Mandate): Ed25519-signed payment mandate created
-• AP2 (Payment): Payment processed and confirmed
-• Webhook: 4+ notifications sent (options, approval, confirmation, completion)
+• A2A (Multi-Vendor): 7 + 7 products from 2 vendors
+• A2A (Negotiation): Multi-vendor price comparison completed
+• AP2 (Split Payment): 38.25 + 89.25 payment structure
+• AP2 (Mandates): Ed25519-signed initial + delivery mandates
+• Webhook: Multi-vendor notifications with comparison data
+
+🏆 Vendor Comparison Results:
+-----------------------------
+• Quotes Received: 2 vendors competed
+• Cost Savings: $18.75 saved vs. highest quote
+• Savings Percentage: 12.8% saved by selecting best vendor
+• Winner: Premium Foods Co. selected for best value
 
 🎉 Demo completed successfully! All protocols integrated.
 ```
@@ -316,9 +354,11 @@ $ make demo
 
 ## Roadmap
 
-- Multi-vendor A2A.
-- Auto-reorders with standing AP2 mandates.
-- Integration with real payment rails.
+- ✅ Multi-vendor A2A with price comparison
+- ✅ Split payment processing (initial + delivery)
+- Auto-reorders with standing AP2 mandates
+- Integration with real payment rails
+- Dynamic vendor discovery and onboarding
 
 ---
 

@@ -11,6 +11,12 @@ export interface MandateRequest {
   currency?: string;
   ttl: string;
   metadata?: any;
+  paymentType?: 'full' | 'initial' | 'delivery';
+  splitPayment?: {
+    initialAmount: number;
+    deliveryAmount: number;
+    totalAmount: number;
+  };
 }
 
 export interface MandateResponse {
@@ -179,6 +185,116 @@ export class AP2Client {
     } catch (error) {
       return false;
     }
+  }
+
+  async processSplitPayments(cartTotal: number, paymentTerms: { initialPayment: number; deliveryPayment: number }, cartId: string): Promise<{
+    initialPayment: PaymentResponse;
+    deliveryMandateId: string;
+    totalPaid: number;
+  }> {
+    try {
+      console.log(`Processing split payment: $${paymentTerms.initialPayment} initial + $${paymentTerms.deliveryPayment} on delivery`);
+
+      // Create and process initial payment
+      const initialTtl = new Date();
+      initialTtl.setMinutes(initialTtl.getMinutes() + 10);
+
+      const initialMandateRequest: MandateRequest = {
+        cartId,
+        payerRef: 'TEAM-OPS-001',
+        amount: Math.round(paymentTerms.initialPayment * 100), // Convert to cents
+        paymentType: 'initial',
+        ttl: initialTtl.toISOString(),
+        splitPayment: {
+          initialAmount: paymentTerms.initialPayment,
+          deliveryAmount: paymentTerms.deliveryPayment,
+          totalAmount: cartTotal
+        }
+      };
+
+      const initialMandate = await this.createMandate(initialMandateRequest);
+      const initialPayment = await this.processPayment(initialMandate);
+
+      // Create delivery payment mandate (not processed yet)
+      const deliveryTtl = new Date();
+      deliveryTtl.setDate(deliveryTtl.getDate() + 3); // Valid for 3 days
+
+      const deliveryMandateRequest: MandateRequest = {
+        cartId: `${cartId}_delivery`,
+        payerRef: 'TEAM-OPS-001',
+        amount: Math.round(paymentTerms.deliveryPayment * 100),
+        paymentType: 'delivery',
+        ttl: deliveryTtl.toISOString(),
+        splitPayment: {
+          initialAmount: paymentTerms.initialPayment,
+          deliveryAmount: paymentTerms.deliveryPayment,
+          totalAmount: cartTotal
+        }
+      };
+
+      const deliveryMandate = await this.createMandate(deliveryMandateRequest);
+
+      // Wait for initial payment confirmation
+      await this.waitForPaymentConfirmation(initialPayment.paymentId);
+
+      return {
+        initialPayment,
+        deliveryMandateId: deliveryMandate.mandateId,
+        totalPaid: paymentTerms.initialPayment
+      };
+    } catch (error) {
+      console.error('Split payment processing failed:', error);
+      throw new Error(`Failed to process split payments: ${error}`);
+    }
+  }
+
+  async processDeliveryPayment(deliveryMandateId: string): Promise<PaymentResponse> {
+    try {
+      // In a real scenario, this would be called when delivery is confirmed
+      // For demo purposes, we'll just process it immediately
+      console.log(`Processing delivery payment for mandate: ${deliveryMandateId}`);
+
+      // This would need to retrieve the mandate and process the delivery payment
+      // For now, we'll simulate it
+      const deliveryPayment: PaymentResponse = {
+        paymentId: `delivery_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        status: 'completed',
+        amount: 0, // Would be set from mandate
+        processed: new Date().toISOString()
+      };
+
+      return deliveryPayment;
+    } catch (error) {
+      console.error('Delivery payment processing failed:', error);
+      throw new Error(`Failed to process delivery payment: ${error}`);
+    }
+  }
+
+  private async waitForPaymentConfirmation(paymentId: string, maxWaitTime = 15000): Promise<void> {
+    const startTime = Date.now();
+    const checkInterval = 2000;
+
+    return new Promise((resolve, reject) => {
+      const checkStatus = async () => {
+        try {
+          const status = await this.getPaymentStatus(paymentId);
+
+          if (status.status === 'completed') {
+            resolve();
+          } else if (status.status === 'failed') {
+            reject(new Error(`Payment failed: ${status.failureReason || 'Unknown error'}`));
+          } else if (Date.now() - startTime > maxWaitTime) {
+            reject(new Error('Payment confirmation timeout'));
+          } else {
+            setTimeout(checkStatus, checkInterval);
+          }
+        } catch (error) {
+          reject(error);
+        }
+      };
+
+      checkStatus();
+    });
   }
 
   getPublicKey(): string | null {
